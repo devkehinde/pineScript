@@ -1,0 +1,307 @@
+//@version=5
+indicator("Candle Range Theory (CRT) Pro", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =========================================================================
+// INPUTS & CONFIGURATION
+// =========================================================================
+
+// Daily Bias Settings
+dailyEmaPeriod = input.int(50, "Daily EMA Period for Bias", minval=1, group="1D Daily Bias Settings", tooltip="EMA on Daily timeframe used to determine overall trend bias")
+
+// Timing & Session Settings
+timezoneInput  = input.string("UTC", "Session Timezone", group="Session Killzones")
+londonSession  = input.string("0800-1500:23456", "London Killzone Time", group="Session Killzones")
+nySession      = input.string("1500-2200:23456", "New York Killzone Time", group="Session Killzones")
+
+// Risk / ATR Buffer Settings
+slBufferTicks  = input.int(5, "Stop Loss Buffer (Ticks/Pips)", minval=0, group="Risk Settings")
+useAtrFilter   = input.bool(true, "Use ATR for Stop Loss Buffer", group="Risk Settings")
+atrPeriod      = input.int(14, "ATR Period for SL Buffer", minval=1, group="Risk Settings")
+atrMultiplier  = input.float(0.2, "ATR Multiplier", minval=0.0, step=0.1, group="Risk Settings")
+
+// Visual Styling Options
+color_range_high  = input.color(#FFD600, "4H Range High Line", group="Style & Colors")
+color_range_low   = input.color(#FFD600, "4H Range Low Line", group="Style & Colors")
+color_range_mid   = input.color(#78909C, "4H Range Midpoint (50%)", group="Style & Colors")
+color_long_sig    = input.color(#00E676, "Bullish Bias / Long Signal", group="Style & Colors")
+color_short_sig   = input.color(#FF1744, "Bearish Bias / Short Signal", group="Style & Colors")
+color_dashboard   = input.color(#1E222D, "Dashboard Background", group="Style & Colors")
+
+// Visual Toggles
+showRangeLines    = input.bool(true, "Show 4H Range Boundaries", group="Visual Options")
+showTradeVisuals  = input.bool(true, "Draw Risk/Reward Setup Box", group="Visual Options")
+showDashboard     = input.bool(true, "Show Dashboard Table", group="Visual Options")
+dashPosition      = input.string("top_right", "Dashboard Position", options=["top_right", "bottom_right", "top_left", "bottom_left"], group="Visual Options")
+
+// =========================================================================
+// 1. MULTI-TIMEFRAME DATA FETCHING
+// =========================================================================
+
+// Fetch Daily Bias data (1D) - Non-repainting
+dailyClose = request.security(syminfo.tickerid, "1D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+dailyEma   = request.security(syminfo.tickerid, "1D", ta.ema(close, dailyEmaPeriod)[1], barmerge.gaps_off, barmerge.lookahead_off)
+dailyBias  = dailyClose > dailyEma ? "BUY" : "SELL"
+
+// Fetch 4-Hour (4H) Range data - Non-repainting
+htf_high  = request.security(syminfo.tickerid, "240", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_low   = request.security(syminfo.tickerid, "240", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_close = request.security(syminfo.tickerid, "240", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_time  = request.security(syminfo.tickerid, "240", time[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema   = request.security(syminfo.tickerid, "240", ta.ema(close, 50)[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Detect 4H candle changes
+htfChanged = ta.change(htf_time) != 0
+
+// Persistent 4H range variables
+var float rangeHigh = na
+var float rangeLow  = na
+var float rangeMid  = na
+
+if htfChanged or na(rangeHigh)
+    rangeHigh := htf_high
+    rangeLow  := htf_low
+    rangeMid  := (htf_high + htf_low) / 2
+
+// Plot 4H Boundaries (with alternating-color dash hack for the midpoint)
+plot(showRangeLines ? rangeHigh : na, color=color_range_high, title="4H Range High", linewidth=2)
+plot(showRangeLines ? rangeLow : na, color=color_range_low, title="4H Range Low", linewidth=2)
+plot(showRangeLines ? rangeMid : na, color = bar_index % 2 == 0 ? color_range_mid : color.new(color_range_mid, 100), title="4H Range Midpoint (50%)", linewidth=1)
+
+// =========================================================================
+// 2. SWEEP DETECTION & TIMING
+// =========================================================================
+
+// Timing / Session Flags
+inLondon = not na(time(timeframe.period, londonSession, timezoneInput))
+inNY     = not na(time(timeframe.period, nySession, timezoneInput))
+timeAligned = inLondon or inNY
+
+// Persistent sweep tracking states
+var bool bslSwept = false // swept high
+var bool sslSwept = false // swept low
+var float sweepHighPrice = na
+var float sweepLowPrice  = na
+
+// Reset sweep states on new 4H candle
+if htfChanged
+    bslSwept := false
+    sslSwept := false
+    sweepHighPrice := na
+    sweepLowPrice  := na
+
+// Track sweeps on current timeframe (15m)
+if not bslSwept and high > rangeHigh
+    bslSwept := true
+    sweepHighPrice := high
+else if bslSwept and high > sweepHighPrice
+    sweepHighPrice := high // Update extreme high of sweep
+
+if not sslSwept and low < rangeLow
+    sslSwept := true
+    sweepLowPrice := low
+else if sslSwept and low < sweepLowPrice
+    sweepLowPrice := low // Update extreme low of sweep
+
+// =========================================================================
+// 3. SIGNAL GENERATION (15m Entry with Daily Bias Filter)
+// =========================================================================
+
+// Signals only trigger in the direction of the Daily Bias
+longSignal  = (dailyBias == "BUY") and sslSwept and close > rangeLow
+shortSignal = (dailyBias == "SELL") and bslSwept and close < rangeHigh
+
+// Reset sweep flags upon signal execution to prevent duplicate entries
+if longSignal
+    sslSwept := false
+if shortSignal
+    bslSwept := false
+
+// ATR for Stop Loss buffer
+atrVal = ta.atr(atrPeriod)
+slBuffer = useAtrFilter ? (atrVal * atrMultiplier) : (syminfo.mintick * slBufferTicks)
+
+// =========================================================================
+// 4. DYNAMIC WIN PROBABILITY CALCULATOR
+// =========================================================================
+
+var int winProbability = 0
+rsi14 = ta.rsi(close, 14)
+volSma = ta.sma(volume, 20)
+
+if longSignal
+    int score = 0
+    
+    // Confluence 1: HTF Trend (25%) - 4H trend aligns with daily bias
+    if htf_close > htf_ema
+        score += 25
+        
+    // Confluence 2: Session Timing (25%) - execution in London/NY Killzones
+    if timeAligned
+        score += 25
+        
+    // Confluence 3: Volume Confirmation (20%) - entry candle has > 1.5x average volume
+    if volume > 1.5 * volSma
+        score += 20
+        
+    // Confluence 4: Momentum Confluence (15%) - RSI was oversold (<35) recently during sweep
+    if ta.lowest(rsi14, 5) < 35
+        score += 15
+        
+    // Confluence 5: Sweep Depth (15%) - sweep went deep (depth > 0.2 ATR)
+    if (rangeLow - sweepLowPrice) > 0.2 * atrVal
+        score += 15
+        
+    winProbability := score
+
+if shortSignal
+    int score = 0
+    
+    // Confluence 1: HTF Trend (25%) - 4H trend aligns with daily bias
+    if htf_close < htf_ema
+        score += 25
+        
+    // Confluence 2: Session Timing (25%) - execution in London/NY Killzones
+    if timeAligned
+        score += 25
+        
+    // Confluence 3: Volume Confirmation (20%) - entry candle has > 1.5x average volume
+    if volume > 1.5 * volSma
+        score += 20
+        
+    // Confluence 4: Momentum Confluence (15%) - RSI was overbought (>65) recently during sweep
+    if ta.highest(rsi14, 5) > 65
+        score += 15
+        
+    // Confluence 5: Sweep Depth (15%) - sweep went deep (depth > 0.2 ATR)
+    if (sweepHighPrice - rangeHigh) > 0.2 * atrVal
+        score += 15
+        
+    winProbability := score
+
+// =========================================================================
+// 5. TRADE SUGGESTION & RISK VISUALIZER
+// =========================================================================
+
+var box setupRiskBox   = na
+var box setupRewardBox = na
+var line setupTp1Line  = na
+var label setupLabel   = na
+
+if longSignal
+    float entryPrice = close
+    float stopLoss   = (na(sweepLowPrice) ? low : sweepLowPrice) - slBuffer
+    float takeProfit2 = rangeHigh
+    float takeProfit1 = rangeMid
+    
+    if showTradeVisuals
+        box.delete(setupRiskBox)
+        box.delete(setupRewardBox)
+        line.delete(setupTp1Line)
+        label.delete(setupLabel)
+        
+        setupRiskBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 20, bottom=stopLoss,
+                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92))
+        setupRewardBox := box.new(left=bar_index, top=takeProfit2, right=bar_index + 20, bottom=entryPrice,
+                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92))
+        setupTp1Line := line.new(bar_index, takeProfit1, bar_index + 20, takeProfit1, color=color_range_mid, style=line.style_dashed, width=1)
+        
+        setupLabel := label.new(x=bar_index, y=low - atrVal * 0.6, text="BUY SETUP\nProbability: " + str.tostring(winProbability) + "%",
+                                color=color_long_sig, textcolor=color.white, style=label.style_label_up, size=size.normal)
+    
+    // Dynamic alert
+    alert("CRT BUY Execution! Bias: BUY | Entry: " + str.tostring(entryPrice) + " | SL: " + str.tostring(stopLoss) + " | TP1: " + str.tostring(takeProfit1) + " | TP2: " + str.tostring(takeProfit2) + " | Win Probability: " + str.tostring(winProbability) + "%", alert.freq_once_per_bar_close)
+
+if shortSignal
+    float entryPrice = close
+    float stopLoss   = (na(sweepHighPrice) ? high : sweepHighPrice) + slBuffer
+    float takeProfit2 = rangeLow
+    float takeProfit1 = rangeMid
+    
+    if showTradeVisuals
+        box.delete(setupRiskBox)
+        box.delete(setupRewardBox)
+        line.delete(setupTp1Line)
+        label.delete(setupLabel)
+        
+        setupRiskBox := box.new(left=bar_index, top=stopLoss, right=bar_index + 20, bottom=entryPrice,
+                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92))
+        setupRewardBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 20, bottom=takeProfit2,
+                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92))
+        setupTp1Line := line.new(bar_index, takeProfit1, bar_index + 20, takeProfit1, color=color_range_mid, style=line.style_dashed, width=1)
+        
+        setupLabel := label.new(x=bar_index, y=high + atrVal * 0.6, text="SELL SETUP\nProbability: " + str.tostring(winProbability) + "%",
+                                color=color_short_sig, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+    // Dynamic alert
+    alert("CRT SELL Execution! Bias: SELL | Entry: " + str.tostring(entryPrice) + " | SL: " + str.tostring(stopLoss) + " | TP1: " + str.tostring(takeProfit1) + " | TP2: " + str.tostring(takeProfit2) + " | Win Probability: " + str.tostring(winProbability) + "%", alert.freq_once_per_bar_close)
+
+// Shapes on signal trigger
+plotshape(longSignal, title="CRT Long Shape", style=shape.triangleup, location=location.belowbar, color=color_long_sig, size=size.small, text="CRT BUY")
+plotshape(shortSignal, title="CRT Short Shape", style=shape.triangledown, location=location.abovebar, color=color_short_sig, size=size.small, text="CRT SELL")
+
+// =========================================================================
+// 6. DETAILS DASHBOARD
+// =========================================================================
+
+var table dashTable = na
+if showDashboard and barstate.islast
+    tablePos = dashPosition == "top_right" ? position.top_right :
+               dashPosition == "bottom_right" ? position.bottom_right :
+               dashPosition == "top_left" ? position.top_left : position.bottom_left
+               
+    dashTable := table.new(tablePos, 2, 6, bgcolor=color_dashboard, border_color=color.new(color_range_mid, 70), border_width=1)
+    
+    // Header
+    table.cell(dashTable, 0, 0, "CRT Pro Dashboard", text_color=color.white, bgcolor=color.new(color_range_mid, 20), text_size=size.small, width=15)
+    table.cell(dashTable, 1, 0, "HTF: 4-Hour | LTF: 15m", text_color=color.white, bgcolor=color.new(color_range_mid, 20), text_size=size.small, width=15)
+    
+    // Daily Bias
+    color biasCol = dailyBias == "BUY" ? color_long_sig : color_short_sig
+    table.cell(dashTable, 0, 1, "Daily Trend Bias (1D)", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 1, dailyBias == "BUY" ? "BULLISH (Buy Only)" : "BEARISH (Sell Only)", text_color=biasCol, text_size=size.small)
+    
+    // HTF (4H) Trend Confluence
+    bool htfBullish = htf_close > htf_ema
+    color htfCol = htfBullish ? color_long_sig : color_short_sig
+    table.cell(dashTable, 0, 2, "HTF 4H Trend Alignment", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 2, htfBullish ? "Bullish Alignment" : "Bearish Alignment", text_color=htfCol, text_size=size.small)
+    
+    // Sweep Status
+    string sweepStatus = "Waiting for Sweep"
+    color sweepCol = color.white
+    if sslSwept
+        sweepStatus := "Range Low Swept (Long Pending)"
+        sweepCol := color_long_sig
+    else if bslSwept
+        sweepStatus := "Range High Swept (Short Pending)"
+        sweepCol := color_short_sig
+    table.cell(dashTable, 0, 3, "Active Sweep Status", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 3, sweepStatus, text_color=sweepCol, text_size=size.small)
+    
+    // Timing Session
+    string sessionName = "Resting/Outside Killzones"
+    color sessionCol = color.white
+    if inLondon
+        sessionName := "London Killzone"
+        sessionCol := color_range_high
+    else if inNY
+        sessionName := "NY Killzone"
+        sessionCol := color_range_high
+    table.cell(dashTable, 0, 4, "Current Timing Session", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 4, sessionName, text_color=sessionCol, text_size=size.small)
+    
+    // Last Win Probability
+    color probCol = winProbability >= 70 ? color_long_sig : (winProbability >= 50 ? color_range_high : color_short_sig)
+    table.cell(dashTable, 0, 5, "Last Execution Prob.", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 5, winProbability > 0 ? str.tostring(winProbability) + "% Confidence" : "No Execution Yet", text_color=probCol, text_size=size.small)
+
+// =========================================================================
+// ALERTS FOR WEBHOOKS
+// =========================================================================
+
+// Alert conditions that can be set up in TradingView's alert creation modal
+alertcondition(longSignal, title="CRT Pro Buy Execution", 
+               message="CRT Buy Signal Triggered on {{ticker}}! Entry: {{close}}, TP1 (Mid): {{plot_2}}, TP2 (High): {{plot_0}}")
+
+alertcondition(shortSignal, title="CRT Pro Sell Execution", 
+               message="CRT Sell Signal Triggered on {{ticker}}! Entry: {{close}}, TP1 (Mid): {{plot_2}}, TP2 (Low): {{plot_1}}")
