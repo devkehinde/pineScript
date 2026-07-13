@@ -51,10 +51,10 @@ if htfChanged or na(rangeHigh)
     rangeLow  := htf_low
     rangeMid  := (htf_high + htf_low) / 2
 
-// Plot HTF Boundaries
+// Plot HTF Boundaries (using a color-alternating hack to draw the midpoint as a dashed line in Pine Script v5)
 plot(showRangeLines ? rangeHigh : na, color=color_range_high, title="HTF Range High", linewidth=2)
 plot(showRangeLines ? rangeLow : na, color=color_range_low, title="HTF Range Low", linewidth=2)
-plot(showRangeLines ? rangeMid : na, color=color_range_mid, title="HTF Range Midpoint (50%)", style=plot.style_dashed, linewidth=1)
+plot(showRangeLines ? rangeMid : na, color = bar_index % 2 == 0 ? color_range_mid : color.new(color_range_mid, 100), title="HTF Range Midpoint (50%)", linewidth=1)
 
 // =========================================================================
 // SWEEP DETECTION & SIGNAL GENERATION
@@ -119,9 +119,9 @@ if longSignal
         box.delete(setupRewardBox)
         line.delete(setupTp1Line)
         setupRiskBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 20, bottom=stopLoss,
-                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92), title="Risk Area (SL)")
+                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92))
         setupRewardBox := box.new(left=bar_index, top=takeProfit2, right=bar_index + 20, bottom=entryPrice,
-                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92), title="Reward Area (TP2)")
+                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92))
         setupTp1Line := line.new(bar_index, takeProfit1, bar_index + 20, takeProfit1, color=color_range_mid, style=line.style_dashed, width=1)
     
     // Webhook-friendly dynamic alert triggering on bar close
@@ -138,9 +138,9 @@ if shortSignal
         box.delete(setupRewardBox)
         line.delete(setupTp1Line)
         setupRiskBox := box.new(left=bar_index, top=stopLoss, right=bar_index + 20, bottom=entryPrice,
-                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92), title="Risk Area (SL)")
+                                 border_color=color.new(color_short_sig, 30), bgcolor=color.new(color_short_sig, 92))
         setupRewardBox := box.new(left=bar_index, top=entryPrice, right=bar_index + 20, bottom=takeProfit2,
-                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92), title="Reward Area (TP2)")
+                                  border_color=color.new(color_long_sig, 30), bgcolor=color.new(color_long_sig, 92))
         setupTp1Line := line.new(bar_index, takeProfit1, bar_index + 20, takeProfit1, color=color_range_mid, style=line.style_dashed, width=1)
 
     // Webhook-friendly dynamic alert triggering on bar close
