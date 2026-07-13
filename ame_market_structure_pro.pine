@@ -1,0 +1,605 @@
+//@version=5
+indicator("AME Market Structure Pro", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ==========================================
+// CONFIGURATION & INPUTS
+// ==========================================
+
+// Styling Color Palette (Institutional Slate & Neon Dark Mode)
+color_bullish     = input.color(#00E676, "Bullish Color", group="Color Theme")
+color_bearish     = input.color(#FF1744, "Bearish Color", group="Color Theme")
+color_neutral     = input.color(#78909C, "Neutral Color", group="Color Theme")
+color_liquidity   = input.color(#FFD600, "Liquidity / Sweep Color", group="Color Theme")
+color_dash_bg     = input.color(#1E222D, "Dashboard BG Color", group="Color Theme")
+
+// Swing Structure Settings
+swingLen          = input.int(5, "Swing Fractal Lookback", minval=2, maxval=20, group="Market Structure Settings", tooltip="Number of bars on each side to confirm a swing high/low")
+showBOS           = input.bool(true, "Show BOS / CHoCH Lines", group="Market Structure Settings")
+showEQHL          = input.bool(true, "Show Equal Highs / Lows (EQH/EQL)", group="Market Structure Settings")
+
+// Order Blocks & FVGs
+showOBs           = input.bool(true, "Show Order Blocks (OB)", group="Order Blocks & FVGs")
+obRangeType       = input.string("Full Candle", "OB Range Calculation", options=["Full Candle", "Body Only"], group="Order Blocks & FVGs")
+showFVGs          = input.bool(true, "Show Fair Value Gaps (FVG)", group="Order Blocks & FVGs")
+fvgTransparency   = input.int(90, "FVG Shading Transparency", minval=50, maxval=98, group="Order Blocks & FVGs")
+
+// AME Cycles (Accumulation, Manipulation, Expansion)
+showAME           = input.bool(true, "Show AME Session Boxes", group="AME Session Settings")
+asiaSession       = input.string("0000-0800:23456", "Asia Session (Accumulation)", group="AME Session Settings")
+londonSession     = input.string("0800-1500:23456", "London Session (Manipulation)", group="AME Session Settings")
+nySession         = input.string("1500-2200:23456", "New York Session (Expansion)", group="AME Session Settings")
+sessionTimezone   = input.string("UTC", "Session Timezone", group="AME Session Settings")
+
+// MTF Confirmation
+useMTF            = input.bool(true, "Enable HTF Confirmation", group="Multi-Timeframe Confirmation")
+htfRes            = input.timeframe("240", "HTF Trend Resolution", group="Multi-Timeframe Confirmation", tooltip="Timeframe used to confirm higher timeframe trend alignment")
+
+// Dashboard & Visual Toggles
+showDashboard     = input.bool(true, "Show Info Dashboard Table", group="Dashboard & Visuals")
+dashPosition      = input.string("top_right", "Dashboard Position", options=["top_right", "bottom_right", "top_left", "bottom_left"], group="Dashboard & Visuals")
+showDealingRange  = input.bool(true, "Show Dealing Range (Premium/Discount)", group="Dashboard & Visuals")
+showTrades        = input.bool(true, "Show Trade Suggestion Visualizer", group="Dashboard & Visuals")
+
+// Memory/Performance Settings
+maxLinesToKeep    = input.int(40, "Max Structure Lines to Keep", minval=10, maxval=100, group="Performance Settings")
+maxOBsToKeep      = input.int(15, "Max Order Blocks to Keep", minval=5, maxval=50, group="Performance Settings")
+maxFVGsToKeep     = input.int(15, "Max FVGs to Keep", minval=5, maxval=50, group="Performance Settings")
+
+// ==========================================
+// DATA STRUCTURES (UDTs)
+// ==========================================
+
+type SwingPoint
+    int index
+    float price
+    bool isHigh
+    bool isBroken
+
+type OrderBlock
+    box rect
+    label lbl
+    float top
+    float bottom
+    bool isBullish
+    bool isMitigated
+    int startIdx
+
+type FairValueGap
+    box rect
+    float top
+    float bottom
+    bool isBullish
+    bool isMitigated
+    int startIdx
+
+// ==========================================
+// PERSISTENT VARIABLES & ARRAYS
+// ==========================================
+
+var SwingPoint[] activeHighs = array.new<SwingPoint>()
+var SwingPoint[] activeLows  = array.new<SwingPoint>()
+
+var OrderBlock[] obArray     = array.new<OrderBlock>()
+var FairValueGap[] fvgArray  = array.new<FairValueGap>()
+
+var line[] structureLines    = array.new_line()
+var label[] structureLabels  = array.new_label()
+
+var string trendBias         = "Neutral"
+var int lastBullishSweepBar  = 0
+var int lastBearishSweepBar  = 0
+
+// ATR for dynamic risk sizing
+atrVal = ta.atr(14)
+
+// ==========================================
+// 1. SWING HIGH / LOW DETECTION
+// ==========================================
+
+pHigh = ta.pivothigh(high, swingLen, swingLen)
+pLow  = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(pHigh)
+    array.push(activeHighs, SwingPoint.new(bar_index - swingLen, pHigh, true, false))
+    if array.size(activeHighs) > 30
+        array.shift(activeHighs)
+
+if not na(pLow)
+    array.push(activeLows, SwingPoint.new(bar_index - swingLen, pLow, false, false))
+    if array.size(activeLows) > 30
+        array.shift(activeLows)
+
+// ==========================================
+// 2. EQUAL HIGHS / LOWS (EQH / EQL)
+// ==========================================
+
+if showEQHL
+    if not na(pHigh) and array.size(activeHighs) >= 2
+        SwingPoint spPrev = array.get(activeHighs, array.size(activeHighs) - 2)
+        if math.abs(pHigh - spPrev.price) / pHigh <= 0.0007
+            line.new(spPrev.index, spPrev.price, bar_index - swingLen, pHigh, color=color_liquidity, width=2, style=line.style_double)
+            label.new(bar_index - swingLen, pHigh, "EQH", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_down, size=size.small)
+            
+    if not na(pLow) and array.size(activeLows) >= 2
+        SwingPoint spPrev = array.get(activeLows, array.size(activeLows) - 2)
+        if math.abs(pLow - spPrev.price) / pLow <= 0.0007
+            line.new(spPrev.index, spPrev.price, bar_index - swingLen, pLow, color=color_liquidity, width=2, style=line.style_double)
+            label.new(bar_index - swingLen, pLow, "EQL", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_up, size=size.small)
+
+// ==========================================
+// 3. BOS & CHOCH DETECTION
+// ==========================================
+
+// Garbage collection helper for structure lines
+cleanStructureDrawings() =>
+    if array.size(structureLines) > maxLinesToKeep
+        line.delete(array.shift(structureLines))
+    if array.size(structureLabels) > maxLinesToKeep
+        label.delete(array.shift(structureLabels))
+
+// Find the latest active (unbroken) swings
+SwingPoint lastActiveHigh = na
+if array.size(activeHighs) > 0
+    for i = array.size(activeHighs) - 1 to 0
+        SwingPoint sp = array.get(activeHighs, i)
+        if not sp.isBroken
+            lastActiveHigh := sp
+            break
+
+SwingPoint lastActiveLow = na
+if array.size(activeLows) > 0
+    for i = array.size(activeLows) - 1 to 0
+        SwingPoint sp = array.get(activeLows, i)
+        if not sp.isBroken
+            lastActiveLow := sp
+            break
+
+// Track breakouts
+bool isBullishBreak = false
+bool isBearishBreak = false
+string breakType = ""
+float breakPrice = na
+int breakOriginIndex = na
+
+if not na(lastActiveHigh) and close > lastActiveHigh.price
+    lastActiveHigh.isBroken := true
+    isBullishBreak := true
+    breakType := trendBias == "Bearish" ? "CHoCH" : "BOS"
+    trendBias := "Bullish"
+    breakPrice := lastActiveHigh.price
+    breakOriginIndex := lastActiveHigh.index
+
+    if showBOS
+        line ln = line.new(lastActiveHigh.index, lastActiveHigh.price, bar_index, lastActiveHigh.price, color=color_bullish, style=line.style_dashed, width=1)
+        label lb = label.new(bar_index, lastActiveHigh.price, breakType + " (Bullish)", color=color.new(color_bullish, 100), textcolor=color_bullish, style=label.style_label_down, size=size.small)
+        array.push(structureLines, ln)
+        array.push(structureLabels, lb)
+        cleanStructureDrawings()
+    
+    alert("Bullish " + breakType + " on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+
+if not na(lastActiveLow) and close < lastActiveLow.price
+    lastActiveLow.isBroken := true
+    isBearishBreak := true
+    breakType := trendBias == "Bullish" ? "CHoCH" : "BOS"
+    trendBias := "Bearish"
+    breakPrice := lastActiveLow.price
+    breakOriginIndex := lastActiveLow.index
+
+    if showBOS
+        line ln = line.new(lastActiveLow.index, lastActiveLow.price, bar_index, lastActiveLow.price, color=color_bearish, style=line.style_dashed, width=1)
+        label lb = label.new(bar_index, lastActiveLow.price, breakType + " (Bearish)", color=color.new(color_bearish, 100), textcolor=color_bearish, style=label.style_label_up, size=size.small)
+        array.push(structureLines, ln)
+        array.push(structureLabels, lb)
+        cleanStructureDrawings()
+        
+    alert("Bearish " + breakType + " on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+
+// ==========================================
+// 4. ORDER BLOCKS (OB)
+// ==========================================
+
+// Helper function to find the source OB candle in the run-up/down
+findOBCandleIndex(bool findBullish, int startIdx, int endIdx) =>
+    int targetIdx = startIdx
+    if findBullish
+        float lowestLow = low[bar_index - startIdx]
+        for i = startIdx to endIdx
+            if close[bar_index - i] < open[bar_index - i] and low[bar_index - i] <= lowestLow * 1.01
+                targetIdx := i
+                lowestLow := low[bar_index - i]
+    else
+        float highestHigh = high[bar_index - startIdx]
+        for i = startIdx to endIdx
+            if close[bar_index - i] > open[bar_index - i] and high[bar_index - i] >= highestHigh * 0.99
+                targetIdx := i
+                highestHigh := high[bar_index - i]
+    targetIdx
+
+if showOBs
+    if isBullishBreak and not na(breakOriginIndex)
+        // Look back near the origin swing low to find the down-candle
+        int obBarOffset = findOBCandleIndex(true, breakOriginIndex, bar_index)
+        float obTop = obRangeType == "Full Candle" ? high[bar_index - obBarOffset] : math.max(open[bar_index - obBarOffset], close[bar_index - obBarOffset])
+        float obBottom = low[bar_index - obBarOffset]
+        
+        box rect = box.new(left=obBarOffset, top=obTop, right=bar_index, bottom=obBottom, 
+                           border_color=color_bullish, bgcolor=color.new(color_bullish, 95), title="Bullish OB")
+        label lbl = label.new(x=obBarOffset, y=obTop, text="+OB", color=color.new(color_bullish, 100), textcolor=color_bullish, size=size.small)
+        
+        array.push(obArray, OrderBlock.new(rect, lbl, obTop, obBottom, true, false, obBarOffset))
+        
+        if array.size(obArray) > maxOBsToKeep
+            OrderBlock oldOB = array.shift(obArray)
+            box.delete(oldOB.rect)
+            label.delete(oldOB.lbl)
+
+    if isBearishBreak and not na(breakOriginIndex)
+        // Look back near the origin swing high to find the up-candle
+        int obBarOffset = findOBCandleIndex(false, breakOriginIndex, bar_index)
+        float obTop = high[bar_index - obBarOffset]
+        float obBottom = obRangeType == "Full Candle" ? low[bar_index - obBarOffset] : math.min(open[bar_index - obBarOffset], close[bar_index - obBarOffset])
+        
+        box rect = box.new(left=obBarOffset, top=obTop, right=bar_index, bottom=obBottom, 
+                           border_color=color_bearish, bgcolor=color.new(color_bearish, 95), title="Bearish OB")
+        label lbl = label.new(x=obBarOffset, y=obBottom, text="-OB", color=color.new(color_bearish, 100), textcolor=color_bearish, size=size.small, style=label.style_label_up)
+        
+        array.push(obArray, OrderBlock.new(rect, lbl, obTop, obBottom, false, false, obBarOffset))
+        
+        if array.size(obArray) > maxOBsToKeep
+            OrderBlock oldOB = array.shift(obArray)
+            box.delete(oldOB.rect)
+            label.delete(oldOB.lbl)
+
+// Update OB limits and check mitigation
+if showOBs and array.size(obArray) > 0
+    for i = array.size(obArray) - 1 to 0
+        OrderBlock ob = array.get(obArray, i)
+        if not ob.isMitigated
+            box.set_right(ob.rect, bar_index)
+            if ob.isBullish
+                if low <= ob.top
+                    ob.isMitigated := true
+                    box.set_bgcolor(ob.rect, color.new(color_bullish, 98))
+                    box.set_border_style(ob.rect, line.style_dashed)
+                    alert("Bullish Order Block Mitigated on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+                if close < ob.bottom
+                    box.delete(ob.rect)
+                    label.delete(ob.lbl)
+                    array.remove(obArray, i)
+            else
+                if high >= ob.bottom
+                    ob.isMitigated := true
+                    box.set_bgcolor(ob.rect, color.new(color_bearish, 98))
+                    box.set_border_style(ob.rect, line.style_dashed)
+                    alert("Bearish Order Block Mitigated on " + syminfo.tickerid, alert.freq_once_per_bar_close)
+                if close > ob.top
+                    box.delete(ob.rect)
+                    label.delete(ob.lbl)
+                    array.remove(obArray, i)
+
+// ==========================================
+// 5. FAIR VALUE GAPS (FVG)
+// ==========================================
+
+if showFVGs
+    // Bullish FVG detection: Candle 0 Low > Candle 2 High, and Candle 1 is Bullish
+    if low[0] > high[2] and close[1] > open[1]
+        box rect = box.new(left=bar_index-2, top=low[0], right=bar_index, bottom=high[2],
+                           border_color=color.new(color_bullish, 70), bgcolor=color.new(color_bullish, fvgTransparency), title="Bullish FVG")
+        array.push(fvgArray, FairValueGap.new(rect, low[0], high[2], true, false, bar_index-2))
+        
+        if array.size(fvgArray) > maxFVGsToKeep
+            FairValueGap oldFVG = array.shift(fvgArray)
+            box.delete(oldFVG.rect)
+
+    // Bearish FVG detection: Candle 0 High < Candle 2 Low, and Candle 1 is Bearish
+    if high[0] < low[2] and close[1] < open[1]
+        box rect = box.new(left=bar_index-2, top=low[2], right=bar_index, bottom=high[0],
+                           border_color=color.new(color_bearish, 70), bgcolor=color.new(color_bearish, fvgTransparency), title="Bearish FVG")
+        array.push(fvgArray, FairValueGap.new(rect, low[2], high[0], false, false, bar_index-2))
+        
+        if array.size(fvgArray) > maxFVGsToKeep
+            FairValueGap oldFVG = array.shift(fvgArray)
+            box.delete(oldFVG.rect)
+
+// Update FVG extensions and mitigation (fully filled)
+if showFVGs and array.size(fvgArray) > 0
+    for i = array.size(fvgArray) - 1 to 0
+        FairValueGap fvg = array.get(fvgArray, i)
+        if not fvg.isMitigated
+            box.set_right(fvg.rect, bar_index)
+            if fvg.isBullish
+                if low <= fvg.bottom
+                    fvg.isMitigated := true
+                    box.delete(fvg.rect)
+                    array.remove(fvgArray, i)
+            else
+                if high >= fvg.top
+                    fvg.isMitigated := true
+                    box.delete(fvg.rect)
+                    array.remove(fvgArray, i)
+
+// ==========================================
+// 6. LIQUIDITY SWEEPS (SWING POINTS)
+// ==========================================
+
+// Sweeping swing high = Bearish trade setup opportunity
+if array.size(activeHighs) > 0
+    for i = 0 to array.size(activeHighs) - 1
+        SwingPoint sp = array.get(activeHighs, i)
+        if not sp.isBroken and high > sp.price and close < sp.price
+            sp.isBroken := true
+            lastBearishSweepBar := bar_index
+            label.new(bar_index, high, "Sweep ✖", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_down, size=size.small)
+            alert("Buy-side liquidity swept (Bearish Reversal)", alert.freq_once_per_bar_close)
+
+// Sweeping swing low = Bullish trade setup opportunity
+if array.size(activeLows) > 0
+    for i = 0 to array.size(activeLows) - 1
+        SwingPoint sp = array.get(activeLows, i)
+        if not sp.isBroken and low < sp.price and close > sp.price
+            sp.isBroken := true
+            lastBullishSweepBar := bar_index
+            label.new(bar_index, low, "Sweep ✖", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_up, size=size.small)
+            alert("Sell-side liquidity swept (Bullish Reversal)", alert.freq_once_per_bar_close)
+
+// ==========================================
+// 7. ACCUMULATION, MANIPULATION, EXPANSION (AME)
+// ==========================================
+
+inAsia   = not na(time(timeframe.period, asiaSession, sessionTimezone))
+inLondon = not na(time(timeframe.period, londonSession, sessionTimezone))
+inNY     = not na(time(timeframe.period, nySession, sessionTimezone))
+
+var float asiaHigh = na
+var float asiaLow  = na
+var box asiaBox    = na
+
+var bool asiaHighSwept = false
+var bool asiaLowSwept  = false
+
+if showAME
+    if inAsia
+        if not inAsia[1] // Asia Session Starts
+            asiaHigh := high
+            asiaLow  := low
+            asiaHighSwept := false
+            asiaLowSwept  := false
+            asiaBox := box.new(left=bar_index, top=high, right=bar_index, bottom=low,
+                               border_color=color.new(color.blue, 50), bgcolor=color.new(color.blue, 96), title="Asia Accumulation Range")
+        else
+            asiaHigh := math.max(asiaHigh, high)
+            asiaLow  := math.min(asiaLow, low)
+            box.set_top(asiaBox, asiaHigh)
+            box.set_bottom(asiaBox, asiaLow)
+            box.set_right(asiaBox, bar_index)
+
+    // London Session (Manipulation Phase)
+    if inLondon
+        if not inLondon[1]
+            // Draw London Session Box
+            box.new(left=bar_index, top=high, right=bar_index+50, bottom=low, 
+                    border_color=color.new(color.orange, 70), bgcolor=color.new(color.orange, 97), title="London Manipulation Range")
+        
+        // Scan for Asia Range sweeps in London
+        if not na(asiaHigh) and not asiaHighSwept and high > asiaHigh and close < asiaHigh
+            asiaHighSwept := true
+            label.new(bar_index, high, "London Asia High Sweep ✖", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_down, size=size.small)
+            alert("London session swept Asia session High (Manipulation)", alert.freq_once_per_bar_close)
+
+        if not na(asiaLow) and not asiaLowSwept and low < asiaLow and close > asiaLow
+            asiaLowSwept := true
+            label.new(bar_index, low, "London Asia Low Sweep ✖", color=color.new(color_liquidity, 100), textcolor=color_liquidity, style=label.style_label_up, size=size.small)
+            alert("London session swept Asia session Low (Manipulation)", alert.freq_once_per_bar_close)
+
+    // NY Session (Expansion Phase)
+    if inNY
+        if not inNY[1]
+            box.new(left=bar_index, top=high, right=bar_index+50, bottom=low, 
+                    border_color=color.new(color_bullish, 70), bgcolor=color.new(color_bullish, 97), title="NY Expansion")
+
+// Current Session State String for Dashboard
+string currentSessionPhase = "Resting"
+if inAsia
+    currentSessionPhase := "Accumulation"
+else if inLondon
+    currentSessionPhase := "Manipulation"
+else if inNY
+    currentSessionPhase := "Expansion"
+
+// ==========================================
+// 8. HTF TREND CONFIRMATION (NON-REPAINTING)
+// ==========================================
+
+htfTrend = "Neutral"
+if useMTF
+    htfClose = request.security(syminfo.tickerid, htfRes, close, barmerge.gaps_off, barmerge.lookahead_off)
+    htfEma   = request.security(syminfo.tickerid, htfRes, ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+    htfTrend := htfClose > htfEma ? "Bullish" : "Bearish"
+
+// ==========================================
+// 9. DEALING RANGE & PREMIUM / DISCOUNT ZONES
+// ==========================================
+
+float majorHigh = na
+float majorLow  = na
+
+if array.size(activeHighs) > 0
+    majorHigh := array.get(activeHighs, array.size(activeHighs) - 1).price
+if array.size(activeLows) > 0
+    majorLow  := array.get(activeLows, array.size(activeLows) - 1).price
+
+equilibrium = (majorHigh + majorLow) / 2
+
+var box premiumBox  = na
+var box discountBox = na
+var line eqLine     = na
+
+if showDealingRange and not na(majorHigh) and not na(majorLow)
+    if na(premiumBox)
+        premiumBox  := box.new(left=bar_index-50, top=majorHigh, right=bar_index, bottom=equilibrium, border_color=color.new(color_bearish, 90), bgcolor=color.new(color_bearish, 98), title="Premium Zone")
+        discountBox := box.new(left=bar_index-50, top=equilibrium, right=bar_index, bottom=majorLow, border_color=color.new(color_bullish, 90), bgcolor=color.new(color_bullish, 98), title="Discount Zone")
+        eqLine      := line.new(bar_index-50, equilibrium, bar_index, equilibrium, color=color_neutral, style=line.style_dashed, width=1)
+    else
+        box.set_left(premiumBox, bar_index - 50)
+        box.set_right(premiumBox, bar_index)
+        box.set_top(premiumBox, majorHigh)
+        box.set_bottom(premiumBox, equilibrium)
+        
+        box.set_left(discountBox, bar_index - 50)
+        box.set_right(discountBox, bar_index)
+        box.set_top(discountBox, equilibrium)
+        box.set_bottom(discountBox, majorLow)
+        
+        line.set_x1(eqLine, bar_index - 50)
+        line.set_x2(eqLine, bar_index)
+        line.set_y1(eqLine, equilibrium)
+        line.set_y2(eqLine, equilibrium)
+
+// ==========================================
+// 10. PROBABILITY SCORE & TRADE CALCULATOR
+// ==========================================
+
+// Scoring Bullish Setups
+inBullishOB = false
+if array.size(obArray) > 0
+    for ob in obArray
+        if ob.isBullish and close >= ob.bottom and close <= ob.top and not ob.isMitigated
+            inBullishOB := true
+            break
+
+inBullishFVG = false
+if array.size(fvgArray) > 0
+    for fvg in fvgArray
+        if fvg.isBullish and close >= fvg.bottom and close <= fvg.top and not fvg.isMitigated
+            inBullishFVG := true
+            break
+
+bullishScore = 0
+if trendBias == "Bullish"
+    bullishScore += 20
+if htfTrend == "Bullish"
+    bullishScore += 20
+if not na(equilibrium) and close < equilibrium
+    bullishScore += 20
+if inBullishOB or inBullishFVG
+    bullishScore += 20
+if (bar_index - lastBullishSweepBar) <= 10
+    bullishScore += 20
+
+// Scoring Bearish Setups
+inBearishOB = false
+if array.size(obArray) > 0
+    for ob in obArray
+        if not ob.isBullish and close >= ob.bottom and close <= ob.top and not ob.isMitigated
+            inBearishOB := true
+            break
+
+inBearishFVG = false
+if array.size(fvgArray) > 0
+    for fvg in fvgArray
+        if not fvg.isBullish and close >= fvg.bottom and close <= fvg.top and not fvg.isMitigated
+            inBearishFVG := true
+            break
+
+bearishScore = 0
+if trendBias == "Bearish"
+    bearishScore += 20
+if htfTrend == "Bearish"
+    bearishScore += 20
+if not na(equilibrium) and close > equilibrium
+    bearishScore += 20
+if inBearishOB or inBearishFVG
+    bearishScore += 20
+if (bar_index - lastBearishSweepBar) <= 10
+    bearishScore += 20
+
+probScore = math.max(bullishScore, bearishScore)
+tradeSetup = "Neutral"
+if bullishScore >= 60 and bullishScore > bearishScore
+    tradeSetup := "Buy"
+else if bearishScore >= 60 and bearishScore > bullishScore
+    tradeSetup := "Sell"
+
+// Visual Trade Generator (Dynamic Reward/Risk Overlay)
+var box setupRiskBox  = na
+var box setupRewardBox = na
+
+if showTrades and tradeSetup != "Neutral"
+    float entryPrice  = close
+    float stopLoss    = tradeSetup == "Buy" ? (na(majorLow) ? close - atrVal * 2 : majorLow - atrVal * 1.5) : (na(majorHigh) ? close + atrVal * 2 : majorHigh + atrVal * 1.5)
+    float takeProfit  = tradeSetup == "Buy" ? (na(majorHigh) ? close + atrVal * 4 : majorHigh) : (na(majorLow) ? close - atrVal * 4 : majorLow)
+    
+    if na(setupRiskBox)
+        setupRiskBox  := box.new(left=bar_index, top=math.max(entryPrice, stopLoss), right=bar_index+15, bottom=math.min(entryPrice, stopLoss), 
+                                 border_color=color.new(color_bearish, 40), bgcolor=color.new(color_bearish, 92), title="Risk Zone")
+        setupRewardBox := box.new(left=bar_index, top=math.max(entryPrice, takeProfit), right=bar_index+15, bottom=math.min(entryPrice, takeProfit), 
+                                  border_color=color.new(color_bullish, 40), bgcolor=color.new(color_bullish, 92), title="Reward Zone")
+    else
+        box.set_left(setupRiskBox, bar_index)
+        box.set_right(setupRiskBox, bar_index + 15)
+        box.set_top(setupRiskBox, tradeSetup == "Buy" ? entryPrice : stopLoss)
+        box.set_bottom(setupRiskBox, tradeSetup == "Buy" ? stopLoss : entryPrice)
+        box.set_bgcolor(setupRiskBox, color.new(color_bearish, 92))
+        
+        box.set_left(setupRewardBox, bar_index)
+        box.set_right(setupRewardBox, bar_index + 15)
+        box.set_top(setupRewardBox, tradeSetup == "Buy" ? takeProfit : entryPrice)
+        box.set_bottom(setupRewardBox, tradeSetup == "Buy" ? entryPrice : takeProfit)
+        box.set_bgcolor(setupRewardBox, color.new(color_bullish, 92))
+
+    alert("Smart Money Trade Suggestion: " + tradeSetup + " at " + str.tostring(entryPrice) + " (Score: " + str.tostring(probScore) + "%)", alert.freq_once_per_bar_close)
+
+// ==========================================
+// 11. DASHBOARD TABLE VISUALIZATION
+// ==========================================
+
+var table dashTable = na
+if showDashboard and barstate.islast
+    tablePos = dashPosition == "top_right" ? position.top_right :
+               dashPosition == "bottom_right" ? position.bottom_right :
+               dashPosition == "top_left" ? position.top_left : position.bottom_left
+               
+    dashTable := table.new(tablePos, 2, 7, bgcolor=color_dash_bg, border_color=color.new(color_neutral, 70), border_width=1)
+    
+    // Header
+    table.cell(dashTable, 0, 0, "AME Market Structure Pro", text_color=color.white, bgcolor=color.new(color_neutral, 20), text_size=size.small, width=15)
+    table.cell(dashTable, 1, 0, "Institutional SMC", text_color=color.white, bgcolor=color.new(color_neutral, 20), text_size=size.small, width=15)
+    
+    // Trend Bias
+    color biasCol = trendBias == "Bullish" ? color_bullish : (trendBias == "Bearish" ? color_bearish : color_neutral)
+    table.cell(dashTable, 0, 1, "Market Bias", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 1, trendBias, text_color=biasCol, text_size=size.small)
+    
+    // HTF Trend Confirmation
+    color htfCol = htfTrend == "Bullish" ? color_bullish : (htfTrend == "Bearish" ? color_bearish : color_neutral)
+    table.cell(dashTable, 0, 2, "HTF Trend (" + htfRes + ")", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 2, htfTrend, text_color=htfCol, text_size=size.small)
+    
+    // Probability Score
+    color scoreCol = tradeSetup == "Buy" ? color_bullish : (tradeSetup == "Sell" ? color_bearish : color_neutral)
+    table.cell(dashTable, 0, 3, "Setup Confidence", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 3, str.tostring(probScore) + "%", text_color=scoreCol, text_size=size.small)
+    
+    // Session State
+    table.cell(dashTable, 0, 4, "SMC Session Cycle", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 4, currentSessionPhase, text_color=color.white, text_size=size.small)
+    
+    // Signal
+    string activeSig = tradeSetup != "Neutral" ? tradeSetup + " Setup Triggered" : "No Setup"
+    table.cell(dashTable, 0, 5, "Trade Generator", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 5, activeSig, text_color=scoreCol, text_size=size.small)
+
+    // Premium/Discount Zone indicator
+    string pdZone = "Equilibrium"
+    color pdCol = color_neutral
+    if not na(equilibrium)
+        if close > equilibrium
+            pdZone := "Premium (Sell Zone)"
+            pdCol := color_bearish
+        else if close < equilibrium
+            pdZone := "Discount (Buy Zone)"
+            pdCol := color_bullish
+    table.cell(dashTable, 0, 6, "Pricing Zone", text_color=color.gray, text_size=size.small)
+    table.cell(dashTable, 1, 6, pdZone, text_color=pdCol, text_size=size.small)

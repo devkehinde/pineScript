@@ -1,0 +1,66 @@
+//@version=5
+indicator("Custom Trend & Momentum Indicator", overlay=true, precision=2)
+
+// ==========================================
+// INPUTS & SETTINGS
+// ==========================================
+// Moving Average Settings
+maType       = input.string("EMA", "Moving Average Type", options=["EMA", "SMA", "WMA"])
+fastLength   = input.int(9, "Fast MA Length", minval=1)
+slowLength   = input.int(21, "Slow MA Length", minval=1)
+
+// RSI Settings
+rsiLength    = input.int(14, "RSI Length", minval=1)
+rsiOverbought = input.int(70, "RSI Overbought Level", minval=50, maxval=100)
+rsiOversold   = input.int(30, "RSI Oversold Level", minval=0, maxval=50)
+
+// Visual Toggle
+showMAs      = input.bool(true, "Show Moving Averages on Chart")
+
+// ==========================================
+// CALCULATIONS
+// ==========================================
+// Function to calculate selected MA
+getMA(type, len) =>
+    switch type
+        "EMA" => ta.ema(close, len)
+        "SMA" => ta.sma(close, len)
+        "WMA" => ta.wma(close, len)
+        => ta.ema(close, len)
+
+// Calculate Fast and Slow Moving Averages
+fastMA = getMA(maType, fastLength)
+slowMA = getMA(maType, slowLength)
+
+// Calculate RSI
+rsiVal = ta.rsi(close, rsiLength)
+
+// Crossover Signals
+bullishCrossover = ta.crossover(fastMA, slowMA)
+bearishCrossunder = ta.crossunder(fastMA, slowMA)
+
+// Signal confirmation using RSI
+buySignal  = bullishCrossover and rsiVal > 50
+sellSignal = bearishCrossunder and rsiVal < 50
+
+// ==========================================
+// PLOTTING & VISUALS
+// ==========================================
+// Plot MAs if enabled
+plot(showMAs ? fastMA : na, color=color.blue, title="Fast MA", linewidth=2)
+plot(showMAs ? slowMA : na, color=color.orange, title="Slow MA", linewidth=2)
+
+// Plot Buy/Sell Signal Shapes on Chart
+plotshape(buySignal,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, text="SELL")
+
+// Background Highlights on Crossover for visual ease
+bgCol = buySignal ? color.new(color.green, 90) : (sellSignal ? color.new(color.red, 90) : na)
+bgcolor(bgCol)
+
+// ==========================================
+// ALERTS
+// ==========================================
+// Alert conditions that can be set up in TradingView UI
+alertcondition(buySignal,  title="Buy Alert",  message="Bullish Crossover with RSI confirmation on {{ticker}}!")
+alertcondition(sellSignal, title="Sell Alert", message="Bearish Crossunder with RSI confirmation on {{ticker}}!")
